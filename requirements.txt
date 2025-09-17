@@ -1,0 +1,12 @@
+flask
+python-dotenv
+PyPDF2
+pdf2image
+easyocr
+numpy
+matplotlib
+opencv-python
+tiktoken
+langchain-community
+langchain-google-genai
+google-generativeai
