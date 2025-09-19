@@ -2,231 +2,111 @@
 import os, re
 from dotenv import load_dotenv
 from flask import Flask, render_template, request
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 import google.generativeai as genai
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from langchain.schema import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import FAISS
 from PyPDF2 import PdfReader
+import pdfplumber
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from langchain_community.document_loaders import DirectoryLoader
-from langchain.chains import LLMChain
 import json
 
 # Get the Google AI API key from the environment variable
 load_dotenv()
-api_key =os.getenv('GOOGLE_API_KEY')
+api_key = os.getenv('GOOGLE_API_KEY')
 
 if api_key is None or api_key == "":
     print("Google AI API key not set or empty. Please set the environment variable.")
-    exit()  # Terminate the program if the API key is not set.
+    exit()
 
 # Initialize the Google AI client with the API key
 genai.configure(api_key=api_key)
 os.environ['GOOGLE_API_KEY'] = api_key
-FAISS_PATH = "/faiss"
 
 # Flask App
 app = Flask(__name__)
 
-vectorstore = None
-conversation_chain = None
 chat_history = []
 general_exclusion_list = ["HIV/AIDS", "Parkinson's disease", "Alzheimer's disease","pregnancy", "substance abuse", "self-inflicted injuries", "sexually transmitted diseases(std)", "pre-existing conditions"]
 
-def get_document_loader():
-    loader = DirectoryLoader('documents', glob="**/*.pdf", show_progress=True, loader_cls=PyPDFLoader)
-    docs = loader.load()
-    return docs
-
-def get_text_chunks(documents: list[Document]):
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_documents(documents)
-    return chunks
-
-def get_embeddings():
-    documents = get_document_loader()
-    chunks = get_text_chunks(documents)
-    db = FAISS.from_documents(
-        chunks, GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    )
-    return db
-
-def get_retriever():
-    db = get_embeddings()
-    retriever = db.as_retriever()
-    return retriever
-
-def get_claim_approval_context():
-    db = get_embeddings()
-    context = db.similarity_search("What are the documents required for claim approval?")
-    claim_approval_context = ""
-    for x in context:
-        claim_approval_context += x.page_content
-    return claim_approval_context
-
-def get_general_exclusion_context():
-    db = get_embeddings()
-    context = db.similarity_search("Give a list of all general exclusions")
-    general_exclusion_context = ""
-    for x in context:
-        general_exclusion_context += x.page_content
-    return general_exclusion_context
-
 def get_file_content(file):
     text = ""
-    if file.filename.endswith(".pdf"):
-        pdf = PdfReader(file)
-        for page_num in range(len(pdf.pages)):
-            page = pdf.pages[page_num]
-            text += page.extract_text()
-    return text
+    try:
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        
+        if not text.strip():
+            pdf = PdfReader(file)
+            for page_num in range(len(pdf.pages)):
+                page = pdf.pages[page_num]
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+                    
+        return text
+        
+    except Exception as e:
+        print(f"Error extracting text from PDF: {e}")
+        return ""
 
 def get_bill_info(data):
-    prompt = """Act as an expert in extracting information from medical invoices. You are given with the invoice details of a patient. Go through the given document carefully and extract the 'disease' and the 'expense amount' from the data. 
-
-Return ONLY a valid JSON object in this exact format: {"disease": "condition_name", "expense": "amount_as_number"}
-
-Make sure to:
-1. Extract the primary disease/condition being treated
-2. Extract the total expense amount as a number only (no currency symbols, no commas)
-3. If multiple diseases are mentioned, focus on the primary one
-4. If expense is not clearly mentioned, return null for expense
-
-INVOICE DETAILS: """ + data
+    prompt = """Extract 'disease' and 'expense amount' from medical document. Return JSON: {"disease": "condition", "expense": "amount"}""" + data
 
     try:
-        # Add debug logging
-        print(f"DEBUG - Processing bill with {len(data)} characters")
-        
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')  # Changed model
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         response = model.generate_content(prompt)
-        
-        # Clean the response text to extract JSON
         response_text = response.text.strip()
-        print(f"DEBUG - Raw response: {response_text}")
         
-        # More robust JSON extraction
-        import re
-        
-        # Try to find JSON pattern
-        json_match = re.search(r'\{[^}]*"disease"[^}]*"expense"[^}]*\}', response_text)
+        json_match = re.search(r'\{[^{}]*\}', response_text)
         if json_match:
-            json_str = json_match.group()
-            print(f"DEBUG - Extracted JSON: {json_str}")
-            data = json.loads(json_str)
+            return json.loads(json_match.group())
         else:
-            # Try simpler extraction
-            if '{' in response_text and '}' in response_text:
-                start = response_text.find('{')
-                end = response_text.rfind('}') + 1
-                json_str = response_text[start:end]
-                print(f"DEBUG - Fallback JSON: {json_str}")
-                data = json.loads(json_str)
-            else:
-                print("DEBUG - No JSON found in response")
-                data = {"disease": None, "expense": None}
+            return {"disease": None, "expense": None}
             
-        print(f"DEBUG - Final extracted data: {data}")
-        return data
-        
-    except json.JSONDecodeError as je:
-        print(f"DEBUG - JSON parsing error: {je}")
-        print(f"DEBUG - Failed to parse: {response_text}")
-        return {"disease": None, "expense": None}
     except Exception as e:
-        print(f"DEBUG - General error in get_bill_info: {e}")
+        print(f"Error in get_bill_info: {e}")
         return {"disease": None, "expense": None}
 
-PROMPT = """You are an AI assistant for verifying health insurance claims. You are given with the references for approving the claim and the patient details. Analyse the given data and predict if the claim should be accepted or not. Use the following guidelines for your analysis.
+def check_claim_rejection(disease, general_exclusion_list, threshold=0.7):
+    """Check if disease is in exclusion list"""
+    if not disease:
+        return False
+        
+    disease_lower = disease.lower()
+    for excluded_disease in general_exclusion_list:
+        excluded_lower = excluded_disease.lower()
+        # Direct match check
+        if excluded_lower in disease_lower or disease_lower in excluded_lower:
+            return True
+        
+        # Similarity check for partial matches
+        vectorizer = CountVectorizer()
+        try:
+            vectors = vectorizer.fit_transform([disease_lower, excluded_lower])
+            similarity = cosine_similarity(vectors[0], vectors[1])[0][0]
+            if similarity > threshold:
+                return True
+        except:
+            continue
+            
+    return False
 
-1. Verify if the patient has provided all necessary information and all necessary documents
-and if you find any incomplete information or required documents are not provided then set INFORMATION criteria as FALSE and REJECT the claim.
-if patient has provided all required documents then set INFORMATION criteria as TRUE. 
+# SHORTENED PROMPT TEMPLATE
+PROMPT = """Insurance Claim Analysis:
 
-2. If any disease mentioned in the medical bill of the patient is in the general exclusions list, set EXCLUSION criteria as FALSE and REJECT the claim.
+PATIENT: {patient_info}
+DISEASE: {disease}
+CLAIM AMOUNT: ${max_amount}
 
-Use this information to verify if the application is valid and to accept or reject the application.
+EXCLUSION CHECK: {exclusion_status}
+REASON: {rejection_reason}
 
-DOCUMENTS FOR CLAIM APPROVAL: {claim_approval_context}
-EXCLUSION LIST : {general_exclusion_context}
-PATIENT INFO : {patient_info}
-MEDICAL BILL : {medical_bill_info}
+DECISION: {decision}
+APPROVED AMOUNT: ${approved_amount}
 
-Use the above information to verify if the application is valid and decide if the application has to be accepted or rejected keeping the guidelines into consideration. 
-
-Generate a detailed report about the claim and procedures you followed for accepting or rejecting the claim and the write the information you used for creating the report. 
-Create a report in the following format
-
-Write whether INFORMATION AND EXCLUSION are TRUE or FALSE 
-Reject the claim if any of them is FALSE.
-Write whether claim is accepted or not. If the claim has been accepted, the maximum amount which can be approved will be {max_amount}
-
-Executive Summary
-[Provide a Summary of the report.]
-
-Introduction
-[Write a paragraph about the aim of this report, and the state of the approval.]
-
-Claim Details
-[Provide details about the submitted claim]
-
-Claim Description
-[Write a short description about claim]
-
-Document Verification
-[Mentions which documents are submitted and if they are verified.] 
-
-Document Summary
-[Give a summary of everything here including the medical reports of the patient]
-
-Please verify for any signs of fraud in the submitted claim if you find the documents required for accepting the claim for the medical treatment.
+SUMMARY: {summary}
 """
-
-prompt = PromptTemplate(input_variables=["claim_approval_context", "general_exclusion_context", "patient_info","max_amount"], template=PROMPT)
-
-def check_claim_rejection(claim_reason, general_exclusion_list, prompt_template, threshold=0.4):
-    vectorizer = CountVectorizer()
-    patient_info_vector = vectorizer.fit_transform([claim_reason])
-
-    for disease in general_exclusion_list:
-        disease_vector = vectorizer.transform([disease])
-        similarity = cosine_similarity(patient_info_vector, disease_vector)[0][0]
-        if float(similarity) > float(threshold):
-            
-            prompt_template = """You are an AI assistant for verifying health insurance claims. You are given with the references for approving the claim and the patient details. Analyse the given data and give a good rejection. You the following guidelines for your analysis.
-            PATIENT INFO : {patient_info}
-
-            Executive Summary
-                [Provide a Summary of the report.]
-
-                Introduction
-                [Write a paragraph about the aim of this report, and the state of the approval.]
-
-                Claim Details
-                [Provide details about the submitted claim]
-
-                Claim Description
-                [Write a short description about claim]
-
-                Document Verification
-                [Mentions which documents are submitted and if they are verified.] 
-
-                Document Summary
-                [Give a summary of everything here including the medical reports of the patient]
-            
-            CLAIM MUST BE REJECTED: Patient has {disease} which is present in the general exclusion list."""
-            return prompt_template
-    
-    return prompt_template
 
 @app.route('/')
 def index():
@@ -234,63 +114,86 @@ def index():
 
 @app.route('/', methods=['GET', 'POST'])
 def msg():
-    claim_validation_message = ""
-    name = request.form['name']
-    address = request.form['address']
-    claim_type = request.form['claim_type']
-    claim_reason = request.form['claim_reason']
-    date = request.form['date']
-    medical_facility = request.form['medical_facility']
-    medical_bill = request.files['medical_bill']
-    total_claim_amount = request.form['total_claim_amount']
-    description = request.form['description']
+    try:
+        name = request.form['name']
+        address = request.form['address']
+        claim_type = request.form['claim_type']
+        claim_reason = request.form['claim_reason']
+        date = request.form['date']
+        medical_facility = request.form['medical_facility']
+        medical_bill = request.files['medical_bill']
+        total_claim_amount = request.form['total_claim_amount']
+        description = request.form['description']
 
-    bill = get_file_content(medical_bill)
-    bill_info = get_bill_info(bill)
-    
-    # If input amount is more than the bill amount - REJECT
-    if bill_info['expense'] != None and int(bill_info['expense']) < int(total_claim_amount):
-        claim_validation_message = "The amount mentioned for claiming is more than the billed amount. Claim Rejected."
+        # Extract text from PDF
+        bill_text = get_file_content(medical_bill)
+        if not bill_text.strip():
+            return render_template("result.html", 
+                output="ERROR: Invalid Consultation Receipt - No text extracted"
+            )
+
+        # Extract disease and expense
+        bill_info = get_bill_info(bill_text)
+
+        if bill_info['disease'] is None or bill_info['expense'] is None:
+            return render_template("result.html", 
+                output="ERROR: Could not extract disease or expense information"
+            )
+
+        # Check amount validity
+        try:
+            bill_expense = float(bill_info['expense']) if bill_info['expense'] else 0
+            claim_amount = float(total_claim_amount)
+            
+            if bill_expense < claim_amount:
+                return render_template("result.html", 
+                    output="REJECTED: Claim amount exceeds billed amount"
+                )
+        except ValueError:
+            return render_template("result.html", 
+                output="ERROR: Invalid amount format"
+            )
+
+        # Check for exclusions - THIS IS THE CRITICAL FIX
+        is_excluded = check_claim_rejection(bill_info["disease"], general_exclusion_list)
         
-        return render_template("result.html", name=name, address=address, claim_type=claim_type, claim_reason=claim_reason, date=date, medical_facility=medical_facility, total_claim_amount=total_claim_amount, description=description, output=claim_validation_message)
-        
-    elif bill_info['expense'] != None and int(bill_info['expense']) > int(total_claim_amount):
-        # Check if the disease is in the exclusion list or not, update the prompt accordingly
-        patient_info = f"Name: {name} " + f"\nAddress: {address} " + f"\nClaim type: {claim_type} " + f"\nClaim reason: {claim_reason}" + f"\nMedical facility: {medical_facility} " + f"\nDate : {date} " + f"\nTotal claim amount: {total_claim_amount}" + f"\nDescription: {description}"
-        medical_bill_info = f"Medical Bill: {bill}"
-        
-        validated_prompt = check_claim_rejection(bill_info["disease"], general_exclusion_list, PROMPT)
-    
-        prompt_template = PromptTemplate(input_variables=["claim_approval_context","patient_info"],template=validated_prompt)
-        
-        # Use Gemini 2.5 Flash for claim processing
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash-exp",
-            temperature=0.3,
-            max_tokens=None,
-            timeout=None,
-            max_retries=2,
+        # Determine claim decision
+        if is_excluded:
+            decision = "REJECTED"
+            approved_amount = "0"
+            exclusion_status = "FAILED - Disease excluded"
+            rejection_reason = f"{bill_info['disease']} is in the exclusion list"
+            summary = f"Claim rejected: {bill_info['disease']} is not covered"
+        else:
+            decision = "APPROVED"
+            approved_amount = total_claim_amount
+            exclusion_status = "PASSED"
+            rejection_reason = "No exclusions found"
+            summary = f"Claim approved for ${total_claim_amount}"
+
+        # Prepare patient info
+        patient_info = f"{name} | {address} | {claim_type} | {medical_facility}"
+
+        # Generate short report
+        report = PROMPT.format(
+            patient_info=patient_info,
+            disease=bill_info["disease"],
+            max_amount=total_claim_amount,
+            exclusion_status=exclusion_status,
+            rejection_reason=rejection_reason,
+            decision=decision,
+            approved_amount=approved_amount,
+            summary=summary
         )
+
+        output = re.sub(r'\n', '<br>', report)
         
-        llmchain = LLMChain(llm=llm, prompt=prompt_template)
-        output = llmchain.run({
-            "claim_approval_context": get_claim_approval_context(), 
-            "general_exclusion_context": get_general_exclusion_context(), 
-            "patient_info": patient_info, 
-            "medical_bill_info": medical_bill_info,
-            "max_amount": total_claim_amount, 
-            "disease": bill_info["disease"]
-        })
-        
-        output = re.sub(r'\n', '<br>', output)
-        
-        return render_template("result.html", name=name, address=address, claim_type=claim_type, claim_reason=claim_reason, date=date, medical_facility=medical_facility, total_claim_amount=total_claim_amount, description=description, output=output)
-        
-    else:
-        # If no expense value has been extracted
-        output = "Please enter a valid Consultation Receipt."
-        
-        return render_template("result.html", name=name, address=address, claim_type=claim_type, claim_reason=claim_reason, date=date, medical_facility=medical_facility, total_claim_amount=total_claim_amount, description=description, output=output)
+        return render_template("result.html", output=output)
+
+    except Exception as e:
+        return render_template("result.html", 
+            output=f"ERROR: System error - {str(e)}"
+        )
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080, debug=True)
