@@ -1,5 +1,6 @@
 # Import necessary libraries
 import os, re
+from dotenv import load_dotenv
 from flask import Flask, render_template, request
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 import google.generativeai as genai
@@ -17,7 +18,8 @@ from langchain.chains import LLMChain
 import json
 
 # Get the Google AI API key from the environment variable
-api_key = ""
+load_dotenv()
+api_key =os.getenv('GOOGLE_API_KEY')
 
 if api_key is None or api_key == "":
     print("Google AI API key not set or empty. Please set the environment variable.")
@@ -91,36 +93,57 @@ def get_file_content(file):
 def get_bill_info(data):
     prompt = """Act as an expert in extracting information from medical invoices. You are given with the invoice details of a patient. Go through the given document carefully and extract the 'disease' and the 'expense amount' from the data. 
 
-Return the data in JSON format: {"disease": "", "expense": ""}
+Return ONLY a valid JSON object in this exact format: {"disease": "condition_name", "expense": "amount_as_number"}
 
 Make sure to:
 1. Extract the primary disease/condition being treated
-2. Extract the total expense amount as a number (without currency symbols)
+2. Extract the total expense amount as a number only (no currency symbols, no commas)
 3. If multiple diseases are mentioned, focus on the primary one
 4. If expense is not clearly mentioned, return null for expense
 
 INVOICE DETAILS: """ + data
 
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        # Add debug logging
+        print(f"DEBUG - Processing bill with {len(data)} characters")
+        
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')  # Changed model
         response = model.generate_content(prompt)
         
         # Clean the response text to extract JSON
         response_text = response.text.strip()
+        print(f"DEBUG - Raw response: {response_text}")
         
-        # Try to find JSON in the response
-        if '{' in response_text and '}' in response_text:
-            start = response_text.find('{')
-            end = response_text.rfind('}') + 1
-            json_str = response_text[start:end]
+        # More robust JSON extraction
+        import re
+        
+        # Try to find JSON pattern
+        json_match = re.search(r'\{[^}]*"disease"[^}]*"expense"[^}]*\}', response_text)
+        if json_match:
+            json_str = json_match.group()
+            print(f"DEBUG - Extracted JSON: {json_str}")
             data = json.loads(json_str)
         else:
-            # Fallback parsing
-            data = {"disease": None, "expense": None}
+            # Try simpler extraction
+            if '{' in response_text and '}' in response_text:
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                json_str = response_text[start:end]
+                print(f"DEBUG - Fallback JSON: {json_str}")
+                data = json.loads(json_str)
+            else:
+                print("DEBUG - No JSON found in response")
+                data = {"disease": None, "expense": None}
             
+        print(f"DEBUG - Final extracted data: {data}")
         return data
+        
+    except json.JSONDecodeError as je:
+        print(f"DEBUG - JSON parsing error: {je}")
+        print(f"DEBUG - Failed to parse: {response_text}")
+        return {"disease": None, "expense": None}
     except Exception as e:
-        print(f"Error in get_bill_info: {e}")
+        print(f"DEBUG - General error in get_bill_info: {e}")
         return {"disease": None, "expense": None}
 
 PROMPT = """You are an AI assistant for verifying health insurance claims. You are given with the references for approving the claim and the patient details. Analyse the given data and predict if the claim should be accepted or not. Use the following guidelines for your analysis.
@@ -270,4 +293,4 @@ def msg():
         return render_template("result.html", name=name, address=address, claim_type=claim_type, claim_reason=claim_reason, date=date, medical_facility=medical_facility, total_claim_amount=total_claim_amount, description=description, output=output)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8081)
+    app.run(host='0.0.0.0', port=8080)
